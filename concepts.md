@@ -7,7 +7,7 @@
 - Floyd's Tortoise and Hare Algorithm 
 - Binary exponentiation to find pow(x, n)
 - Sliding window algorithm: generally used to find maximum or minimum subarray, substring of fixed size.
-
+- Binary Search on answers: if you know the range of answer, and it's limited, We can sometimes use binary search to find answer. See leet-875.
 ## Things to keep in mind
 1. `substr` is heavy, use for loop and index based comparison if possible.
 2. Use array as hashmap if you know how much elements are needed ex. to count character frequency in string.
