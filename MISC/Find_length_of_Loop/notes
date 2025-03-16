@@ -1,0 +1,20 @@
+1 -> 2 -> 3 -> 4 -> 5 -> 2 ...
+
+slow = 1 fast = 1
+slow = 2 fast = 3
+slow = 3 fast = 5
+slow = 4 fast = 3
+slow = 5 fast = 5 <- loop is present
+
+slow = 2
+
+25->14->19->33->10->21->39->90->58->45->33
+
+slow = 25 fast = 25
+slow = 14 fast = 19
+slow = 19 fast = 10
+slow = 33 fast = 39
+slow = 10 fast = 58
+slow = 21 fast = 33
+slow = 39 fast = 21
+slow = k

@@ -23,7 +23,7 @@ public:
         while (low <= high) {
             int sumOfSub = low + (high - low) / 2;
 
-            if (subArraysPossible(nums, sumOfSub) == k) {
+            if (subArraysPossible(nums, sumOfSub) <= k) {
                 // we need to minimize so move left
                 high = sumOfSub - 1;
             }  else {
