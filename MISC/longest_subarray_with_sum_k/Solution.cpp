@@ -1,48 +1,42 @@
-//{ Driver Code Starts
 #include <bits/stdc++.h>
 using namespace std;
 
+/*
+Given an array nums of size n and an integer k, find the length of the longest sub-array that sums to k. If no such sub-array exists, return 0.
 
-// } Driver Code Ends
-class Solution {
-  public:
-    int longestSubarray(vector<int>& arr, int k) {
-        // code here
-        int currSum = k;
-        int currLen = 0;
-        int maxLen = 0;
+https://takeuforward.org/plus/dsa/problems/longest-subarray-with-sum-k
 
+*/
+
+class Solution{
+public:
+    int longestSubarray(vector<int> &nums, int k){
+        int cs = 0; // current sum
+        int cl = 0; // current length
+        int ml = 0; // max length
+
+        for (int i=0; i < nums.size(); i++) {
+            cs += nums[i];
+            cl++;
+
+            if (cs >= k) {
+                ml = max(cl, ml);
+                // reset cs to current nums[i]
+                cs = nums[i];
+                cl = 1;
+            }
+        }
+
+        return ml; // return max length
     }
 };
 
-//{ Driver Code Starts.
-
-int main() {
-    int t;
-    cin >> t;
-    cin.ignore(); // Ignore newline character after t
-
-    while (t--) {
-        vector<int> arr;
-        int k;
-        string inputLine;
-
-        getline(cin, inputLine); // Read the array input as a line
-        stringstream ss(inputLine);
-        int value;
-        while (ss >> value) {
-            arr.push_back(value);
-        }
-
-        cin >> k;
-        cin.ignore(); // Ignore newline character after k input
-
-        Solution solution;
-        cout << solution.longestSubarray(arr, k) << "\n";
-        cout << "~\n";
-    }
-
+int main()
+{
+    Solution s = *new Solution();
+    // vector<int> nums = {10, 5, 2, 7, 1, 9};
+    vector<int> nums = {1, 2, 1, 2, 1};
+    int k = 3;
+    cout << s.longestSubarray(nums, k) << endl;
     return 0;
 }
-
-// } Driver Code Ends
