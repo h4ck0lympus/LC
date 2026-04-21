@@ -1,1 +1,1 @@
-![status](https://leetcode-badge-sage.vercel.app/badge/heisunburger?theme=dark)
+![LeetCode Stats](https://leetcard.jacoblin.cool/heisunburger?theme=light&font=Akshar)
