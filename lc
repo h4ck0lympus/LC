@@ -1,0 +1,1285 @@
+#!/usr/bin/env python3
+"""lc - test and push LeetCode solutions from the terminal.
+
+  lc pull 547              fetch the stub and example testcases into 547/
+  lc pull 547 --lang py    ...as 547/Solution.py (-l py and --lang=py work too)
+  lc test 547              run 547/Solution.<ext> against 547/tests.txt
+  lc push 547              push 547/Solution.<ext> for judging
+  lc lang [name]           show or set the default language
+  lc todo                  list problems tagged TODO / REVIEW
+
+The problem number may be omitted when you are inside the problem directory.
+The language comes from --lang, else $LC_LANG, else `lc lang`, else C++;
+test and push pick it from the Solution.* file in the problem directory.
+`// lc:local-begin` ... `// lc:local-end` blocks are never sent to LeetCode.
+Session cookies live in ~/.config/lc/cookies.json; see `lc` with no arguments.
+"""
+
+import getpass
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+BASE = "https://leetcode.com"
+UA = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
+      "Chrome/124.0.0.0 Safari/537.36")
+ROOT = Path(__file__).resolve().parent
+CONFIG = Path(os.environ.get("XDG_CONFIG_HOME") or "~/.config").expanduser() / "lc"
+COOKIE_FILE = CONFIG / "cookies.json"
+INDEX_FILE = CONFIG / "problems.json"
+CONFIG_FILE = CONFIG / "config.json"
+
+QUESTION_QUERY = """query q($titleSlug: String!) {
+  question(titleSlug: $titleSlug) {
+    questionId questionFrontendId title titleSlug exampleTestcaseList
+    codeSnippets { langSlug code }
+  }
+}"""
+
+
+class Fail(Exception):
+    """A problem worth reporting to the user without a traceback."""
+
+
+# ---------------------------------------------------------------- formatting
+
+_COLOR = sys.stdout.isatty() and os.environ.get("NO_COLOR") is None
+
+
+def c(code, text):
+    return f"\033[{code}m{text}\033[0m" if _COLOR else text
+
+
+def green(t):
+    return c("32", t)
+
+
+def red(t):
+    return c("31", t)
+
+
+def yellow(t):
+    return c("33", t)
+
+
+def dim(t):
+    return c("2", t)
+
+
+def bold(t):
+    return c("1", t)
+
+
+# ---------------------------------------------------------------- languages
+
+# The one table of supported languages: canonical name -> LeetCode's langSlug,
+# the solution file extension (unique - it is how `lc test` detects the
+# language), a display label, and the local syntax checker, if any.
+LANGS = {
+    "cpp":        {"slug": "cpp",        "ext": ".cpp",   "label": "C++",        "check": "g++"},
+    "c":          {"slug": "c",          "ext": ".c",     "label": "C",          "check": "gcc"},
+    "java":       {"slug": "java",       "ext": ".java",  "label": "Java",       "check": None},
+    "python3":    {"slug": "python3",    "ext": ".py",    "label": "Python3",    "check": "python"},
+    "rust":       {"slug": "rust",       "ext": ".rs",    "label": "Rust",       "check": None},
+    "go":         {"slug": "golang",     "ext": ".go",    "label": "Go",         "check": None},
+    "javascript": {"slug": "javascript", "ext": ".js",    "label": "JavaScript", "check": None},
+    "typescript": {"slug": "typescript", "ext": ".ts",    "label": "TypeScript", "check": None},
+    "kotlin":     {"slug": "kotlin",     "ext": ".kt",    "label": "Kotlin",     "check": None},
+    "swift":      {"slug": "swift",      "ext": ".swift", "label": "Swift",      "check": None},
+    "csharp":     {"slug": "csharp",     "ext": ".cs",    "label": "C#",         "check": None},
+    "ruby":       {"slug": "ruby",       "ext": ".rb",    "label": "Ruby",       "check": None},
+    "scala":      {"slug": "scala",      "ext": ".scala", "label": "Scala",      "check": None},
+    "php":        {"slug": "php",        "ext": ".php",   "label": "PHP",        "check": None},
+    "dart":       {"slug": "dart",       "ext": ".dart",  "label": "Dart",       "check": None},
+}
+
+# Other spellings people type, lower-case -> canonical name.
+LANG_ALIASES = {
+    "c++": "cpp", "cc": "cpp",
+    "py": "python3", "python": "python3",
+    "rs": "rust",
+    "golang": "go",
+    "js": "javascript",
+    "ts": "typescript",
+    "kt": "kotlin",
+    "cs": "csharp", "c#": "csharp",
+    "rb": "ruby",
+}
+
+DEFAULT_LANG = "cpp"
+
+
+def canonical_lang(name):
+    """Resolve a language name or alias, case-insensitively."""
+    key = (name or "").strip().lower()
+    key = LANG_ALIASES.get(key, key)
+    if key not in LANGS:
+        raise Fail(f"Unknown language '{name}'. Choose one of: {', '.join(LANGS)}")
+    return key
+
+
+def solution_name(lang):
+    """The solution filename for a canonical language, e.g. Solution.py."""
+    return "Solution" + LANGS[lang]["ext"]
+
+
+# ------------------------------------------------------------ local blocks
+
+# Lines between these markers exist only for your editor or compiler and are
+# removed before code is sent to LeetCode. Rust stubs need one: they say
+# `impl Solution` while the judge supplies `struct Solution` itself.
+LOCAL_BEGIN = "// lc:local-begin (removed before sending to LeetCode)"
+LOCAL_END = "// lc:local-end"
+
+
+def _is_marker(line, marker):
+    """Match a marker by its `// lc:local-...` tag, ignoring trailing text."""
+    tag = marker.split(" ")[1]
+    return re.fullmatch(rf"\s*//\s*{re.escape(tag)}\b.*", line) is not None
+
+
+def strip_local(code):
+    """Remove every lc:local block in `code`, markers included.
+
+    Preserve all lines outside the markers exactly, including imports and blank
+    lines. An unclosed or stray marker raises Fail rather than guessing and
+    sending local-only code.
+    """
+    out, start = [], None
+    for i, line in enumerate(code.split("\n"), 1):
+        if _is_marker(line, LOCAL_BEGIN):
+            if start is not None:
+                raise Fail(f"lc:local-begin on line {i} is nested inside the "
+                           f"block opened on line {start}.")
+            start = i
+        elif _is_marker(line, LOCAL_END):
+            if start is None:
+                raise Fail(f"lc:local-end on line {i} has no matching lc:local-begin.")
+            start = None
+        else:
+            if start is None:
+                out.append(line)
+    if start is not None:
+        raise Fail(f"lc:local-begin on line {start} is never closed with "
+                   f"`{LOCAL_END}`.")
+    return "\n".join(out)
+
+
+def commented_definitions(stub):
+    """Uncomment the `// Definition for ...` type blocks in a Rust stub.
+
+    LeetCode ships ListNode, TreeNode and friends only as comments, so a
+    local build cannot see them. Each block runs from the `Definition for`
+    line to the first line that is not a comment.
+    """
+    out, inside = [], False
+    for line in stub.split("\n"):
+        stripped = line.strip()
+        if stripped.startswith("// Definition for"):
+            inside = True
+            continue
+        if inside and stripped.startswith("//"):
+            body = stripped[2:]
+            out.append(body[1:] if body.startswith(" ") else body)
+            continue
+        inside = False
+    while out and not out[-1].strip():
+        out.pop()
+    return "\n".join(out)
+
+
+def local_prelude(lang, stub):
+    """The local-only block to put above a fresh stub, or "" for none."""
+    if lang != "rust" or not re.search(r"\bimpl\s+Solution\b", stub):
+        return ""  # design problems define their own struct
+    if re.search(r"\bstruct\s+Solution\b", strip_local(stub)):
+        return ""
+    lines = [LOCAL_BEGIN, "pub struct Solution;"]
+    defs = commented_definitions(stub)
+    if defs:
+        lines += ["", defs]
+    lines.append(LOCAL_END)
+    return "\n".join(lines) + "\n"
+
+
+def lang_aliases(lang):
+    """Aliases that resolve to `lang`, in table order."""
+    return [alias for alias, target in LANG_ALIASES.items() if target == lang]
+
+
+# ------------------------------------------------------------- pure helpers
+
+def problem_number(name):
+    """Extract the problem number from a directory name.
+
+    Directories carry optional suffixes, e.g. 1021_TODO or 28_REVIEW.
+    Returns None for anything that is not a problem directory.
+    """
+    m = re.fullmatch(r"(\d+)(?:_.*)?", name)
+    return m.group(1) if m else None
+
+
+def clean_credential(value):
+    """Tidy a pasted cookie value.
+
+    People paste these straight out of DevTools, which often means a
+    `KEY=value` pair or a quoted string. Accept those shapes.
+    """
+    value = (value or "").strip().strip(",;")
+    for key in ("LEETCODE_SESSION", "csrftoken"):
+        if value.startswith(key + "="):
+            value = value[len(key) + 1:]
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+        value = value[1:-1]
+    return value.strip()
+
+
+def parse_credentials(text):
+    """Read credentials piped to `lc login --stdin`.
+
+    Accepts a JSON object, `KEY=value` / `KEY: value` lines, or just the two
+    values on their own lines in session-then-token order.
+    """
+    text = (text or "").strip()
+    if not text:
+        raise Fail("Nothing on stdin.\n\n" + COOKIE_HELP)
+
+    if text.startswith("{"):
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError as e:
+            raise Fail(f"stdin is not valid JSON: {e}") from None
+        return {k: clean_credential(data.get(k)) for k in
+                ("LEETCODE_SESSION", "csrftoken")}
+
+    lines = [ln for ln in (l.strip() for l in text.splitlines()) if ln]
+    creds = {}
+    for line in lines:
+        for sep in ("=", ":"):
+            key, found, rest = line.partition(sep)
+            if found and key.strip() in ("LEETCODE_SESSION", "csrftoken"):
+                creds[key.strip()] = clean_credential(rest)
+                break
+
+    if not creds and len(lines) == 2:
+        creds = {"LEETCODE_SESSION": clean_credential(lines[0]),
+                 "csrftoken": clean_credential(lines[1])}
+    if not creds:
+        raise Fail("Could not read credentials from stdin.\n\n" + COOKIE_HELP)
+    return creds
+
+
+def build_index(payload):
+    """Map frontend problem number -> {slug, qid} from /api/problems/all/."""
+    index = {}
+    for pair in payload.get("stat_status_pairs", []):
+        stat = pair.get("stat", {})
+        fid = stat.get("frontend_question_id")
+        slug = stat.get("question__title_slug")
+        qid = stat.get("question_id")
+        if fid is None or not slug:
+            continue
+        index[str(fid)] = {"slug": slug, "qid": str(qid)}
+    return index
+
+
+def split_cases(data_input, n_cases):
+    """Split raw judge input into one block per testcase.
+
+    A testcase spans one line per argument, so arity is inferred from the
+    number of answers the judge returned. Falls back to a single block when
+    the lines do not divide evenly.
+    """
+    lines = data_input.split("\n")
+    if n_cases <= 0 or len(lines) % n_cases != 0:
+        return ["\n".join(lines)]
+    per = len(lines) // n_cases
+    return ["\n".join(lines[i * per:(i + 1) * per]) for i in range(n_cases)]
+
+
+def _compile_error(r):
+    """Return formatted compile error output, or None."""
+    for key in ("full_compile_error", "compile_error"):
+        if r.get(key):
+            return f"{red('Compile Error')}\n\n{r[key]}"
+    return None
+
+
+# Extensions whose runtime errors come from the C/C++ sanitizers, the only
+# traces the standard-library hint below is about.
+SANITIZED_EXTS = (LANGS["cpp"]["ext"], LANGS["c"]["ext"])
+
+
+def _runtime_error(r, filename):
+    """Return the runtime error text plus a hint, or None.
+
+    The C/C++ sanitizer reports the innermost frame, which is often a
+    standard library header (`Line 1263 ... (basic_string.h)`). That line
+    number is meaningless in the solution file, so say so rather than let it
+    mislead. LeetCode may spell the solution file in lower case
+    (`solution.cpp`), so the comparison ignores case. Other languages get
+    their trace unannotated - the hint's advice is C++-specific.
+    """
+    text = r.get("full_runtime_error") or r.get("runtime_error")
+    if not text:
+        return None
+    lines = [red(line) for line in text.rstrip("\n").split("\n")]
+    m = re.search(r"\(([\w.+-]+)\)\s*$", text.split("\n")[0])
+    sanitized = Path(filename).suffix.lower() in SANITIZED_EXTS
+    if sanitized and m and m.group(1).lower() != filename.lower():
+        lines.append(dim(f"hint: that line is inside {m.group(1)} (the standard "
+                         "library), not your code - look for an out-of-range "
+                         "index or iterator"))
+    return "\n".join(lines)
+
+
+def _case_lines(case, stdout):
+    """Indented input and stdout lines for one testcase."""
+    out = []
+    if case is not None:
+        out += [dim(f"      input     {line}") for line in case.split("\n")]
+    if stdout:
+        out += [dim(f"      stdout    {line}")
+                for line in stdout.rstrip("\n").split("\n")]
+    return out
+
+
+def fmt_run(r, data_input="", filename=solution_name(DEFAULT_LANG)):
+    """Format the judge's response to a `Run` against example testcases.
+
+    On a runtime error or time limit the judge stops at the failing case and
+    returns answers only for the cases before it, so the failing case is
+    the one right after the last answer. On a clean run it appends a phantom
+    empty answer past the last case, which is dropped here.
+    """
+    err = _compile_error(r)
+    if err:
+        return err
+
+    answers = r.get("code_answer") or []
+    expected = r.get("expected_code_answer") or []
+    stdout = r.get("std_output_list") or []
+    total = r.get("total_testcases")
+    if isinstance(total, int):
+        answers = answers[:total]
+    else:
+        total = len(answers)
+    stopped = r.get("run_success") is False and len(answers) < total
+    cases = split_cases(data_input, total)
+    out = []
+
+    for i, got in enumerate(answers):
+        want = expected[i] if i < len(expected) else None
+        ok = want is not None and got == want
+        mark = green("PASS") if ok else red("FAIL")
+        out.append(f"{mark}  case {i + 1}")
+        out += _case_lines(cases[i] if i < len(cases) else None,
+                           stdout[i] if i < len(stdout) else "")
+        out.append(f"      output    {got if ok else red(got)}")
+        if not ok:
+            out.append(f"      expected  {green(want)}")
+
+    if stopped:
+        i = len(answers)
+        reason = r.get("status_msg") or "Error"
+        out.append(f"{red('FAIL')}  case {i + 1}  {red(reason)}")
+        out += _case_lines(cases[i] if i < len(cases) else None,
+                           stdout[i] if i < len(stdout) else "")
+        if i < len(expected) and expected[i]:
+            out.append(f"      expected  {green(expected[i])}")
+        if i + 1 < total:
+            skipped = f"case {total}" if i + 2 == total else f"cases {i + 2}-{total}"
+            out.append(dim(f"      {skipped} not run"))
+
+    rt_err = _runtime_error(r, filename)
+    if rt_err:
+        out += ["", rt_err]
+
+    status = r.get("status_msg", "Unknown")
+    # A run that finishes reports "Accepted" even when answers are wrong.
+    if r.get("run_success") and not r.get("correct_answer"):
+        status = "Wrong Answer"
+    total, ncorrect = r.get("total_testcases"), r.get("total_correct")
+    tint = green if r.get("correct_answer") else red
+    summary = tint(status)
+    if total is not None:
+        summary += f"  {ncorrect}/{total} cases"
+    if r.get("status_runtime"):
+        summary += dim(f"  ({r['status_runtime']})")
+    out.append("")
+    out.append(summary)
+    return "\n".join(out)
+
+
+def fmt_push(r, filename=solution_name(DEFAULT_LANG)):
+    """Format the judge's response to a full submission."""
+    err = _compile_error(r)
+    if err:
+        return err
+
+    status = r.get("status_msg", "Unknown")
+    accepted = r.get("status_code") == 10
+    out = [bold(green(status)) if accepted else bold(red(status))]
+
+    total, ncorrect = r.get("total_testcases"), r.get("total_correct")
+    if total is not None:
+        out.append(f"  {ncorrect}/{total} cases passed")
+
+    if accepted:
+        rt, rp = r.get("status_runtime"), r.get("runtime_percentile")
+        mem, mp = r.get("status_memory"), r.get("memory_percentile")
+        if rt:
+            pct = f"  beats {rp:.1f}%" if isinstance(rp, (int, float)) else ""
+            out.append(f"  runtime  {rt}{dim(pct)}")
+        if mem:
+            pct = f"  beats {mp:.1f}%" if isinstance(mp, (int, float)) else ""
+            out.append(f"  memory   {mem}{dim(pct)}")
+        return "\n".join(out)
+
+    if r.get("last_testcase"):
+        out.append("")
+        for line in r["last_testcase"].split("\n"):
+            out.append(dim(f"  input     {line}"))
+    if r.get("code_output"):
+        out.append(f"  output    {red(r['code_output'])}")
+    if r.get("expected_output"):
+        out.append(f"  expected  {green(r['expected_output'])}")
+    if r.get("std_output"):
+        for line in r["std_output"].rstrip("\n").split("\n"):
+            out.append(dim(f"  stdout    {line}"))
+    rt_err = _runtime_error(r, filename)
+    if rt_err:
+        out += ["", rt_err]
+    return "\n".join(out)
+
+
+# ------------------------------------------------------------------ network
+
+def http_json(url, data=None, headers=None, timeout=30):
+    body = json.dumps(data).encode() if data is not None else None
+    req = urllib.request.Request(url, data=body, method="POST" if body else "GET")
+    req.add_header("User-Agent", UA)
+    if body:
+        req.add_header("Content-Type", "application/json")
+    for k, v in (headers or {}).items():
+        req.add_header(k, v)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read().decode()
+    except urllib.error.HTTPError as e:
+        if e.code in (401, 403):
+            raise Fail("LeetCode rejected the session (HTTP %d).\n"
+                       "Your cookies have most likely expired - re-copy them:\n"
+                       "  %s" % (e.code, COOKIE_FILE)) from None
+        if e.code == 429:
+            raise Fail("Rate limited by LeetCode (HTTP 429). Wait a minute.") from None
+        raise Fail(f"HTTP {e.code} from {url}\n{e.read().decode()[:400]}") from None
+    except urllib.error.URLError as e:
+        raise Fail(f"Network error talking to LeetCode: {e.reason}") from None
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        raise Fail("LeetCode returned a non-JSON response (are you logged in?)\n"
+                   f"{raw[:400]}") from None
+
+
+COOKIE_HELP = """Run `lc login` and paste the two values at the hidden prompt.
+
+Get them from your browser: open leetcode.com while logged in, then
+DevTools -> Application -> Cookies -> https://leetcode.com
+Copy LEETCODE_SESSION (a long JWT) and csrftoken (a short string)."""
+
+
+def load_cookies():
+    if not COOKIE_FILE.exists():
+        raise Fail(f"No session cookies found.\n\n{COOKIE_HELP}")
+    raw = COOKIE_FILE.read_text()
+    if not raw.strip():
+        raise Fail(f"{COOKIE_FILE} is empty.\n\n{COOKIE_HELP}")
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as e:
+        raise Fail(f"{COOKIE_FILE} is not valid JSON: {e}\n\n{COOKIE_HELP}") from None
+    missing = [k for k in ("LEETCODE_SESSION", "csrftoken") if not data.get(k)]
+    if missing:
+        raise Fail(f"{COOKIE_FILE} is missing: {', '.join(missing)}\n\n{COOKIE_HELP}")
+    return data
+
+
+def cookie_headers(ck, referer=f"{BASE}/"):
+    return {
+        "Cookie": f"LEETCODE_SESSION={ck['LEETCODE_SESSION']}; csrftoken={ck['csrftoken']}",
+        "x-csrftoken": ck["csrftoken"],
+        "Referer": referer,
+        "Origin": BASE,
+    }
+
+
+def auth_headers(slug):
+    return cookie_headers(load_cookies(), f"{BASE}/problems/{slug}/")
+
+
+def user_status(ck):
+    """Return (signed_in, username) for a set of cookies."""
+    resp = http_json(f"{BASE}/graphql",
+                     data={"query": "query { userStatus { username isSignedIn } }"},
+                     headers=cookie_headers(ck))
+    status = ((resp.get("data") or {}).get("userStatus") or {})
+    return bool(status.get("isSignedIn")), status.get("username") or ""
+
+
+def save_cookies(ck):
+    CONFIG.mkdir(parents=True, exist_ok=True)
+    try:
+        CONFIG.chmod(0o700)
+    except OSError:
+        pass
+    COOKIE_FILE.touch(mode=0o600, exist_ok=True)
+    COOKIE_FILE.chmod(0o600)
+    COOKIE_FILE.write_text(json.dumps(ck) + "\n")
+
+
+def cached_index():
+    """Return the cached problem index, or {} when there is none - no network."""
+    try:
+        return json.loads(INDEX_FILE.read_text())
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def load_config():
+    """Return the saved settings, or {} when missing or corrupt - like cached_index."""
+    try:
+        data = json.loads(CONFIG_FILE.read_text())
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def save_config(updates):
+    """Merge `updates` into config.json, replacing the file atomically.
+
+    A corrupt or non-object config.json is replaced (its contents could not
+    be read anyway). Any failure to write is a Fail, and leaves no .tmp file.
+    """
+    data = load_config()
+    data.update(updates)
+    tmp = CONFIG_FILE.with_name(CONFIG_FILE.name + ".tmp")
+    try:
+        CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
+        tmp.write_text(json.dumps(data, indent=2) + "\n")
+        tmp.replace(CONFIG_FILE)
+    except OSError as e:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise Fail(f"Could not save {CONFIG_FILE}: {e}") from None
+
+
+def env_lang():
+    """The canonical $LC_LANG, or None when unset or blank.
+
+    A bad value is an error that names LC_LANG: it was not typed on this
+    command line, so the bare 'Unknown language' would not lead you to it.
+    """
+    env = os.environ.get("LC_LANG", "").strip()
+    if not env:
+        return None
+    try:
+        return canonical_lang(env)
+    except Fail:
+        raise Fail(f"$LC_LANG={env!r} is not a known language - unset it or "
+                   f"set it to one of: {', '.join(LANGS)}") from None
+
+
+def saved_lang():
+    """Return (lang, source) from config.json, else the built-in default.
+
+    A bad saved value counts as no default, the same as a corrupt file.
+    """
+    saved = load_config().get("lang")
+    if isinstance(saved, str):
+        try:
+            return canonical_lang(saved), str(CONFIG_FILE)
+        except Fail:
+            pass
+    return DEFAULT_LANG, "built-in default"
+
+
+def default_lang():
+    """Return (lang, source) for the default language, ignoring --lang.
+
+    $LC_LANG beats the saved default, which beats C++.
+    """
+    env = env_lang()
+    if env:
+        return env, "LC_LANG"
+    return saved_lang()
+
+
+def resolve_lang(flag_lang):
+    """Return (lang, source): an explicit --lang wins over every default."""
+    if flag_lang:
+        return canonical_lang(flag_lang), "--lang"
+    return default_lang()
+
+
+def load_index(refresh=False):
+    if not refresh:
+        index = cached_index()
+        if index:
+            return index
+    print(dim("fetching problem list..."), file=sys.stderr)
+    index = build_index(http_json(f"{BASE}/api/problems/all/"))
+    CONFIG.mkdir(parents=True, exist_ok=True)
+    INDEX_FILE.write_text(json.dumps(index))
+    return index
+
+
+def lookup(num):
+    """Resolve a problem number to {slug, qid}, refreshing the cache on a miss."""
+    entry = load_index().get(num)
+    if entry is None:
+        entry = load_index(refresh=True).get(num)
+    if entry is None:
+        raise Fail(f"No LeetCode problem numbered {num}.")
+    return entry
+
+
+def fetch_question(slug):
+    resp = http_json(f"{BASE}/graphql",
+                     data={"query": QUESTION_QUERY, "variables": {"titleSlug": slug}},
+                     headers={"Referer": f"{BASE}/problems/{slug}/"})
+    q = (resp.get("data") or {}).get("question")
+    if not q:
+        raise Fail(f"LeetCode returned no data for '{slug}'.")
+    return q
+
+
+def poll(check_url, headers, what):
+    """Poll a judge result until it leaves the queue."""
+    deadline = time.time() + 90
+    spin = "|/-\\"
+    i = 0
+    while time.time() < deadline:
+        r = http_json(check_url, headers=headers)
+        if r.get("state") == "SUCCESS":
+            if _COLOR:
+                sys.stderr.write("\r\033[K")
+                sys.stderr.flush()
+            return r
+        if _COLOR:
+            sys.stderr.write(f"\r{spin[i % 4]} {what}...")
+            sys.stderr.flush()
+        i += 1
+        time.sleep(0.4)
+    raise Fail("Timed out waiting for the judge (90s).")
+
+
+# ----------------------------------------------------------------- the repo
+
+def problem_dir(num):
+    """Find the directory for a problem number, allowing _TODO-style suffixes."""
+    dirs = problem_dirs(num)
+    return dirs[0] if dirs else ROOT / num
+
+
+def problem_dirs(num):
+    """Every directory for a problem number: plain and suffixed, plain first."""
+    dirs = [d for d in ROOT.glob(f"{num}_*")
+            if d.is_dir() and problem_number(d.name) == num]
+    exact = ROOT / num
+    return ([exact] if exact.is_dir() else []) + sorted(dirs)
+
+
+def tag_of(name):
+    """The suffix after the number, e.g. TODO for 1021_TODO, or None."""
+    _, sep, tag = name.partition("_")
+    return tag if sep else None
+
+
+def resolve(arg):
+    """Determine which problem to act on, from an argument or the cwd."""
+    if arg:
+        num = problem_number(arg)
+        if num is None:
+            raise Fail(f"'{arg}' is not a problem number.")
+        return num
+    num = problem_number(Path.cwd().name)
+    if num is None:
+        raise Fail("Not inside a problem directory - pass a number, e.g. `lc test 547`.")
+    return num
+
+
+def solution_files(d):
+    """Map lang -> path for each Solution.<ext> file in `d`, in LANGS order."""
+    found = {}
+    for lang in LANGS:
+        path = d / solution_name(lang)
+        if path.is_file():
+            found[lang] = path
+    return found
+
+
+def pick_lang(num, d, found, flag_lang):
+    """Choose which solution to act on from the files present.
+
+    An explicit --lang must have its file. Otherwise a lone file decides;
+    with several, the default language breaks the tie if it has a file.
+    """
+    if flag_lang:
+        if flag_lang not in found:
+            raise Fail(f"{d / solution_name(flag_lang)} does not exist. "
+                       f"Run `lc pull {num} --lang {flag_lang}` first.")
+        return flag_lang
+    if not found:
+        raise Fail(f"No Solution.* file in {d}. Run `lc pull {num}` first.")
+    if len(found) == 1:
+        return next(iter(found))
+    default, _ = default_lang()
+    if default in found:
+        return default
+    names = ", ".join(p.name for p in found.values())
+    raise Fail(f"Several solutions in {d}: {names}.\n"
+               f"Pick one with --lang ({', '.join(found)}), or set it as the "
+               "default with `lc lang <name>`.")
+
+
+def read_solution(num, flag_lang=None):
+    """Return (lang, path, code) for the solution to test or push.
+
+    When the default language broke a tie between several files, say which
+    file was chosen (on stderr) - otherwise an untouched stub could be
+    judged in place of the file you were editing, with nothing to show it.
+    """
+    d = problem_dir(num)
+    found = solution_files(d)
+    lang = pick_lang(num, d, found, flag_lang)
+    path = found[lang]
+    if not flag_lang and len(found) > 1:
+        others = ", ".join(p.name for l, p in found.items() if l != lang)
+        print(dim(f"using {path.name} (default language; also {others} - "
+                  "--lang to choose)"), file=sys.stderr)
+    code = strip_local(path.read_text())
+    if not code.strip():
+        raise Fail(f"{path} is empty.")
+    return lang, path, code
+
+
+# Headers LeetCode's C judge includes for you; without them gcc rejects
+# malloc, bool and friends as undeclared.
+C_PRELUDE = ("stdbool.h", "stddef.h", "stdint.h", "stdio.h", "stdlib.h",
+             "string.h", "limits.h", "math.h", "ctype.h")
+
+
+def _compiler_check(cmd, path, tool):
+    """Run a -fsyntax-only compile; skip quietly if the compiler is missing."""
+    try:
+        proc = subprocess.run(cmd + [str(path)], capture_output=True, text=True)
+    except FileNotFoundError:
+        return  # toolchain not installed; let the judge catch it
+    if proc.returncode != 0:
+        raise Fail(f"{red('Compile error')} (local {tool})\n\n{proc.stderr.rstrip()}")
+
+
+def _python_check(path):
+    """Byte-compile in-process; reports the first SyntaxError with its line."""
+    try:
+        compile(path.read_text(), str(path), "exec", dont_inherit=True)
+    except SyntaxError as e:
+        where = f"{path.name}, line {e.lineno}" if e.lineno else path.name
+        out = [f"{red('Syntax error')} (local python)", "", f"{where}: {e.msg}"]
+        if e.text and e.text.strip():
+            out.append("    " + e.text.rstrip("\n").strip())
+        raise Fail("\n".join(out)) from None
+    except ValueError as e:  # e.g. null bytes, on older Pythons
+        raise Fail(f"{red('Syntax error')} (local python)\n\n{path.name}: {e}") from None
+
+
+def syntax_check(path, lang=DEFAULT_LANG):
+    """Check locally so typos cost a second, not a network round-trip.
+
+    Languages without a local checker are left to the judge.
+    """
+    check = LANGS[lang]["check"]
+    if check == "g++":
+        cmd = ["g++", "-std=c++23", "-fsyntax-only"]
+        header = ROOT / "leetcode.h"
+        if header.exists():
+            cmd += ["-include", str(header)]
+        _compiler_check(cmd, path, "g++")
+    elif check == "gcc":
+        cmd = ["gcc", "-std=gnu17", "-fsyntax-only"]
+        for h in C_PRELUDE:
+            cmd += ["-include", h]
+        _compiler_check(cmd, path, "gcc")
+    elif check == "python":
+        _python_check(path)
+
+
+# ----------------------------------------------------------------- commands
+
+def offered_langs(q):
+    """Canonical names of the languages a question has stubs for."""
+    slugs = {s.get("langSlug") for s in q.get("codeSnippets") or []}
+    return [lang for lang, info in LANGS.items() if info["slug"] in slugs]
+
+
+def snippet_for(q, lang, slug):
+    """The stub code for `lang`, or Fail naming what is on offer."""
+    stub = next((s.get("code") for s in q.get("codeSnippets") or []
+                 if s.get("langSlug") == LANGS[lang]["slug"]), "")
+    if stub and stub.strip():
+        return stub
+    offered = offered_langs(q)
+    hint = (f"Available: {', '.join(offered)}" if offered
+            else "It has no stub in any supported language (SQL or shell?).")
+    raise Fail(f"No {LANGS[lang]['label']} snippet available for '{slug}'.\n{hint}")
+
+
+def _existing_file(path):
+    """True if `path` is a file to keep; Fail if something else is in the way."""
+    if path.is_file():
+        return True
+    if path.exists():
+        raise Fail(f"{path} exists but is not a file - move it out of the way.")
+    return False
+
+
+def cargo_manifest(num):
+    """A Cargo.toml that makes a problem directory a one-file library crate.
+
+    rust-analyzer only understands Cargo projects; without this it finds no
+    project at all. The empty [workspace] keeps the crate standalone.
+    """
+    return ("# Written by `lc pull` so rust-analyzer and cargo can check\n"
+            "# Solution.rs locally. Never sent to LeetCode.\n"
+            "[package]\n"
+            f'name = "lc-{num}"\n'
+            'version = "0.0.0"\n'
+            'edition = "2021"\n'
+            "publish = false\n"
+            "\n"
+            "[lib]\n"
+            'path = "Solution.rs"\n'
+            "\n"
+            "[workspace]\n")
+
+
+def ensure_cargo_manifest(d, num):
+    """Write d/Cargo.toml unless one exists; return a note for the summary."""
+    manifest = d / "Cargo.toml"
+    if _existing_file(manifest):
+        return dim("kept existing Cargo.toml")
+    manifest.write_text(cargo_manifest(num))
+    return green("wrote Cargo.toml")
+
+
+def cmd_pull(num, flag_lang=None):
+    # Local checks first: a bad language or a blocked path costs no request.
+    lang, _ = resolve_lang(flag_lang)
+    d = problem_dir(num)
+    sol, tests_file = d / solution_name(lang), d / "tests.txt"
+    keep_sol, keep_tests = _existing_file(sol), _existing_file(tests_file)
+    if lang == "rust":
+        _existing_file(d / "Cargo.toml")  # fail early if a dir is in the way
+
+    entry = lookup(num)
+    slug = entry["slug"]
+    q = fetch_question(slug)
+    # Settle the stub before touching the disk, so a problem with no stub
+    # for this language leaves nothing half-pulled behind.
+    stub = None if keep_sol else snippet_for(q, lang, slug)
+    d.mkdir(parents=True, exist_ok=True)
+
+    if keep_sol:
+        sol_note = dim(f"kept existing {sol.name}")
+    else:
+        sol.write_text(local_prelude(lang, stub) + stub.rstrip() + "\n")
+        sol_note = green(f"wrote {sol.name}")
+
+    # tests.txt is yours once it exists (you add cases to it), and it is
+    # shared by every language in the directory - never overwrite it.
+    examples = q.get("exampleTestcaseList") or []
+    if keep_tests:
+        tests_note = dim(f"kept existing {tests_file.name}")
+    else:
+        tests = "\n".join(examples)
+        tests_file.write_text(tests + "\n" if tests else "")
+        tests_note = f"{len(examples)} example cases -> {tests_file}"
+
+    if lang == "rust":
+        sol_note += ", " + ensure_cargo_manifest(d, num)
+
+    print(f"{bold(num)}. {q.get('title', slug)}  {dim(BASE + '/problems/' + slug + '/')}")
+    print(f"  {sol_note}, {tests_note}")
+
+
+def read_tests(num, d):
+    """The contents of d/tests.txt, or Fail if it is missing or empty."""
+    tests_file = d / "tests.txt"
+    if not tests_file.is_file():
+        raise Fail(f"{tests_file} does not exist. Run `lc pull {num}` first.")
+    data_input = tests_file.read_text().rstrip("\n")
+    if not data_input:
+        raise Fail(f"{tests_file} is empty.")
+    return data_input
+
+
+def _judge(num, lang, code, endpoint, id_key, what, refuse, extra=None):
+    """Send code to the judge and poll for the result.
+
+    Shared by test (interpret_solution, interpret_id) and push (submit,
+    submission_id). Returns (id, result).
+    """
+    entry = lookup(num)
+    slug, qid = entry["slug"], entry["qid"]
+    headers = auth_headers(slug)
+    data = {"lang": LANGS[lang]["slug"], "question_id": qid, "typed_code": code}
+    data.update(extra or {})
+    r = http_json(f"{BASE}/problems/{slug}/{endpoint}/", data=data, headers=headers)
+    job = r.get(id_key)
+    if not job:
+        raise Fail(f"{refuse}: {json.dumps(r)[:300]}")
+    return job, poll(f"{BASE}/submissions/detail/{job}/check/", headers, what)
+
+
+def cmd_test(num, flag_lang=None):
+    # Local problems first: a missing file or a typo should not cost a request.
+    lang, path, code = read_solution(num, flag_lang)
+    syntax_check(path, lang)
+    data_input = read_tests(num, path.parent)
+    _, result = _judge(num, lang, code, "interpret_solution", "interpret_id",
+                       "running", "LeetCode did not start a run",
+                       extra={"data_input": data_input})
+    print(fmt_run(result, data_input, path.name))
+    return 0 if result.get("correct_answer") else 1
+
+
+def cmd_push(num, flag_lang=None):
+    # Local problems first: a missing file or a typo should not cost a request.
+    lang, path, code = read_solution(num, flag_lang)
+    syntax_check(path, lang)
+    sid, result = _judge(num, lang, code, "submit", "submission_id",
+                         "judging", "LeetCode did not accept the submission")
+    print(fmt_push(result, path.name))
+    print(dim(f"  {BASE}/submissions/detail/{sid}/"))
+    return 0 if result.get("status_code") == 10 else 1
+
+
+def cmd_lang(rest):
+    if len(rest) > 1:
+        raise Fail("`lc lang` takes at most one language name.")
+    if rest and rest[0].startswith("-"):
+        raise Fail(f"Unknown option '{rest[0]}' for `lc lang`.")
+    if rest:
+        lang = canonical_lang(rest[0])
+        save_config({"lang": lang})
+        print(f"{green('default language')} {bold(lang)}  {dim(str(CONFIG_FILE))}")
+        env = os.environ.get("LC_LANG", "").strip()
+        if env:
+            print(dim(f"  note: LC_LANG={env} overrides this in the current shell"))
+        return 0
+
+    # Showing is how you diagnose a bad $LC_LANG, so report it, still list
+    # the languages, and exit non-zero rather than refuse to show anything.
+    try:
+        current, source = default_lang()
+    except Fail as e:
+        current, status = None, 1
+        print(f"{red('default language unknown')}: {e}")
+    else:
+        status = 0
+        print(f"default language {bold(current)}  {dim('from ' + source)}")
+    print()
+    for lang, info in LANGS.items():
+        mark = "*" if lang == current else " "
+        aliases = ", ".join(lang_aliases(lang))
+        print(f"  {mark} {lang:<11} {solution_name(lang):<15} {dim(aliases)}".rstrip())
+    print()
+    print(dim("set with `lc lang <name>`, $LC_LANG, or per pull with --lang"))
+    return status
+
+
+def parse_lang_args(cmd, rest):
+    """Split pull/test/push arguments into (number or None, lang or None).
+
+    --lang X, -l X and --lang=X may sit before or after the number.
+    """
+    number, lang = None, None
+    i = 0
+    while i < len(rest):
+        a = rest[i]
+        if a in ("--lang", "-l"):
+            if i + 1 >= len(rest) or rest[i + 1].startswith("-"):
+                raise Fail(f"{a} needs a language, e.g. `lc {cmd} 547 {a} python3`.")
+            value, i = rest[i + 1], i + 2
+        elif a.startswith("--lang="):
+            value, i = a[len("--lang="):], i + 1
+            if not value:
+                raise Fail(f"--lang= needs a language, e.g. `lc {cmd} 547 --lang=python3`.")
+        elif a.startswith("-"):
+            raise Fail(f"Unknown option '{a}' for `lc {cmd}`. "
+                       "Only --lang L, -l L or --lang=L is accepted.")
+        else:
+            if number is not None:
+                raise Fail(f"`lc {cmd}` takes one problem number, got '{number}' and '{a}'.")
+            number, i = a, i + 1
+            continue
+        if lang is not None:
+            raise Fail("--lang given more than once.")
+        lang = canonical_lang(value)
+    return number, lang
+
+
+TODO_TAGS = {"add": "TODO", "review": "REVIEW"}
+
+
+def retag(num, tag):
+    """Rename the problem's directory to carry `tag` (None strips it).
+
+    Returns (old_dir or None, new_dir). Refuses rather than guess whenever
+    more than one directory exists for the number, since merging two
+    solutions is a decision for a human.
+    """
+    target = ROOT / (f"{num}_{tag}" if tag else num)
+    dirs = problem_dirs(num)
+    if tag is None and not any(tag_of(d.name) for d in dirs):
+        raise Fail(f"{num} is not tagged.")
+    if tag is not None and target in dirs:
+        return target, target
+    if len(dirs) > 1:
+        names = ", ".join(d.name for d in dirs)
+        raise Fail(f"Several directories exist for {num} ({names}).\n"
+                   "Merge them by hand first.")
+    if not dirs:
+        target.mkdir()
+        return None, target
+    dirs[0].rename(target)
+    return dirs[0], target
+
+
+def todo_entries():
+    """Tagged problems as {tag: [(num, dir)]}, numerically sorted."""
+    groups = {}
+    for d in ROOT.iterdir():
+        num = problem_number(d.name)
+        tag = tag_of(d.name)
+        if d.is_dir() and num and tag:
+            groups.setdefault(tag, []).append((num, d))
+    for entries in groups.values():
+        entries.sort(key=lambda e: (int(e[0]), e[1].name))
+    return groups
+
+
+def cmd_todo(rest):
+    if not rest:
+        groups = todo_entries()
+        if not groups:
+            print(dim("nothing tagged - `lc todo add <number>` to add one"))
+            return 0
+        index = cached_index()
+        known = [t for t in ("TODO", "REVIEW") if t in groups]
+        order = known + sorted(t for t in groups if t not in known)
+        for i, tag in enumerate(order):
+            if i:
+                print()
+            print(bold(f"{tag} ({len(groups[tag])})"))
+            for num, d in groups[tag]:
+                slug = (index.get(num) or {}).get("slug", "")
+                print(f"  {num:>5}  {slug}")
+        return 0
+
+    action, arg = rest[0], rest[1] if len(rest) > 1 else None
+    if len(rest) > 2:
+        raise Fail(f"`lc todo {action}` takes at most one problem number.")
+    if action not in TODO_TAGS and action != "done":
+        raise Fail(f"Unknown todo action '{action}'. Use add, review or done.")
+    num = resolve(arg)
+    old, new = retag(num, TODO_TAGS.get(action))
+    if old == new:
+        print(dim(f"{new.name} already"))
+    elif old is None:
+        print(f"{green('created')} {new.name}/")
+    else:
+        print(f"{old.name} -> {green(new.name)}")
+    if arg is None and old is not None and old != new:
+        print(dim(f"  you are in a renamed directory: cd ../{new.name}"))
+    return 0
+
+
+def prompt_masked(label):
+    """Read a secret from the terminal, echoing '*' for each character.
+
+    getpass shows nothing at all, which makes it easy to mistrust a long
+    paste. Falls back to getpass wherever raw terminal mode is unavailable.
+    """
+    try:
+        import termios
+        import tty
+    except ImportError:
+        return getpass.getpass(label)
+
+    fd = sys.stdin.fileno()
+    try:
+        saved = termios.tcgetattr(fd)
+    except termios.error:
+        return getpass.getpass(label)
+
+    def echo(text):
+        sys.stdout.write(text)
+        sys.stdout.flush()
+
+    echo(label)
+    chars = []
+    try:
+        # TCSADRAIN, not the TCSAFLUSH default: flushing would discard
+        # anything already typed or pasted ahead of the prompt.
+        tty.setraw(fd, termios.TCSADRAIN)
+        while True:
+            ch = sys.stdin.read(1)
+            if ch in ("\r", "\n", ""):
+                break
+            if ch == "\x03":                      # Ctrl-C
+                raise KeyboardInterrupt
+            if ch == "\x04":                      # Ctrl-D
+                if not chars:
+                    raise EOFError
+                break
+            if ch in ("\x7f", "\b"):             # backspace
+                if chars:
+                    chars.pop()
+                    echo("\b \b")
+                continue
+            if ch == "\x15":                      # Ctrl-U, clear the line
+                echo("\b \b" * len(chars))
+                chars.clear()
+                continue
+            if not ch.isprintable():
+                continue
+            chars.append(ch)
+            echo("*")
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, saved)
+        echo("\n")
+    return "".join(chars)
+
+
+def cmd_login(use_stdin):
+    if use_stdin:
+        creds = parse_credentials(sys.stdin.read())
+    elif not sys.stdin.isatty():
+        raise Fail("`lc login` needs a terminal to prompt on.\n"
+                   "Pipe the credentials instead:  lc login --stdin")
+    else:
+        print(dim("Paste from DevTools -> Application -> Cookies -> leetcode.com"))
+        print(dim("Input is masked; backspace and ctrl-u work."))
+        creds = {}
+        for key in ("LEETCODE_SESSION", "csrftoken"):
+            creds[key] = clean_credential(prompt_masked(f"  {key}: "))
+
+    missing = [k for k in ("LEETCODE_SESSION", "csrftoken") if not creds.get(k)]
+    if missing:
+        raise Fail(f"No value given for: {', '.join(missing)}")
+
+    signed_in, username = user_status(creds)
+    if not signed_in:
+        raise Fail("LeetCode does not recognise those cookies - nothing was saved.\n"
+                   "Check you copied the full LEETCODE_SESSION value (it is long)\n"
+                   "and that you are logged in at leetcode.com in that browser.")
+
+    save_cookies(creds)
+    print(f"{green('logged in')} as {bold(username)}  {dim(str(COOKIE_FILE))}")
+    return 0
+
+
+def cmd_whoami():
+    signed_in, username = user_status(load_cookies())
+    if not signed_in:
+        raise Fail("Session expired or invalid. Run `lc login` to refresh it.")
+    print(f"{green('signed in')} as {bold(username)}")
+    return 0
+
+
+USAGE = """lc - test and push LeetCode solutions from the terminal
+
+  lc login              store your session cookies (hidden prompt)
+  lc login --stdin      read them from a pipe instead
+  lc whoami             check whether the session is still valid
+
+  lc pull <number> [--lang L]   fetch the stub and example testcases
+  lc test [number] [--lang L]   run against tests.txt (edit it to add cases)
+  lc push [number] [--lang L]   push for judging
+                    (-l L and --lang=L work too, before or after the number)
+
+  lc lang               show the default language and the supported ones
+  lc lang <name>        set the default language (e.g. python3, rust, go)
+
+  lc todo               list tagged problems
+  lc todo add [number]      tag as TODO (renames the dir to <number>_TODO)
+  lc todo review [number]   tag as REVIEW
+  lc todo done [number]     drop the tag
+
+The number is optional inside a problem directory: `cd 547 && lc test`.
+Language: --lang, else $LC_LANG, else `lc lang`, else cpp. test and push
+use the Solution.<ext> file present; with several, the default or --lang.
+Pulling another language keeps an existing tests.txt and Solution files.
+Lines between `// lc:local-begin` and `// lc:local-end` are local-only and
+stripped before sending; Rust stubs get one with `pub struct Solution;` and
+the ListNode/TreeNode definitions, plus a Cargo.toml for rust-analyzer.
+Session cookies: %s
+""" % COOKIE_FILE
+
+
+def main(argv):
+    if not argv or argv[0] in ("-h", "--help", "help"):
+        print(USAGE)
+        return 0
+    cmd, rest = argv[0], argv[1:]
+    if cmd == "login":
+        unknown = [a for a in rest if a != "--stdin"]
+        if unknown:
+            raise Fail(f"`lc login` takes only --stdin, not {unknown[0]}.\n"
+                       "Credentials are never passed as arguments - they would be\n"
+                       "recorded in your shell history and visible in `ps`.")
+        return cmd_login("--stdin" in rest)
+    if cmd == "whoami":
+        return cmd_whoami()
+    if cmd in ("pull", "test", "push", "lang") and ("-h" in rest or "--help" in rest):
+        print(USAGE)
+        return 0
+    if cmd in ("pull", "test", "push"):
+        arg, flag_lang = parse_lang_args(cmd, rest)
+        if cmd == "pull":
+            if not arg:
+                raise Fail("`lc pull` needs a problem number.")
+            return cmd_pull(resolve(arg), flag_lang) or 0
+        if cmd == "test":
+            return cmd_test(resolve(arg), flag_lang)
+        return cmd_push(resolve(arg), flag_lang)
+    if cmd == "lang":
+        return cmd_lang(rest)
+    if cmd == "todo":
+        return cmd_todo(rest)
+    raise Fail(f"Unknown command '{cmd}'. Try `lc --help`.")
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv[1:]))
+    except Fail as e:
+        print(f"{red('error')}: {e}", file=sys.stderr)
+        sys.exit(2)
+    except KeyboardInterrupt:
+        print(file=sys.stderr)
+        sys.exit(130)
+    except EOFError:
+        print(f"\n{red('error')}: cancelled - nothing was saved.", file=sys.stderr)
+        sys.exit(130)

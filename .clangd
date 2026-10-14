@@ -1,0 +1,7 @@
+CompileFlags:
+  Add:
+    - -std=c++23
+    - -include
+    - /home/p4nic/code/leet/leetcode.h
+    - -Wall
+    - -Wextra

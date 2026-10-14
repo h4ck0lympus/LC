@@ -1,0 +1,4 @@
+# Every problem's Cargo.toml (written by `lc pull --lang rust`) builds into
+# one shared, git-ignored target/ here instead of littering each directory.
+[build]
+target-dir = "target"

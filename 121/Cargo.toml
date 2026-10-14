@@ -1,0 +1,12 @@
+# Written by `lc pull` so rust-analyzer and cargo can check
+# Solution.rs locally. Never sent to LeetCode.
+[package]
+name = "lc-121"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[lib]
+path = "Solution.rs"
+
+[workspace]
